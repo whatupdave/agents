@@ -77,6 +77,68 @@ function waitForDone(
   });
 }
 
+function waitForRequestDone(
+  ws: WebSocket,
+  requestId: string,
+  timeout = 10000
+): Promise<Array<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const messages: Array<Record<string, unknown>> = [];
+    const timer = setTimeout(
+      () => reject(new Error(`Timeout waiting for request ${requestId}`)),
+      timeout
+    );
+    const handler = (e: MessageEvent) => {
+      try {
+        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
+        messages.push(msg);
+        if (
+          msg.type === MSG_CHAT_RESPONSE &&
+          msg.id === requestId &&
+          msg.done === true
+        ) {
+          clearTimeout(timer);
+          ws.removeEventListener("message", handler);
+          resolve(messages);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    ws.addEventListener("message", handler);
+  });
+}
+
+function waitForRequestChunk(
+  ws: WebSocket,
+  requestId: string,
+  timeout = 10000
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timeout waiting for chunk ${requestId}`)),
+      timeout
+    );
+    const handler = (e: MessageEvent) => {
+      try {
+        const msg = JSON.parse(e.data as string) as Record<string, unknown>;
+        if (
+          msg.type === MSG_CHAT_RESPONSE &&
+          msg.id === requestId &&
+          msg.done === false
+        ) {
+          clearTimeout(timer);
+          ws.removeEventListener("message", handler);
+          resolve(msg);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    ws.addEventListener("message", handler);
+  });
+}
+
 function closeWS(ws: WebSocket): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, 200);
@@ -233,6 +295,97 @@ describe("Think — agentic loop", () => {
         (m) => m.type === MSG_CHAT_RESPONSE && m.done === true
       );
       expect(doneMsg).toBeDefined();
+
+      await closeWS(ws);
+    });
+
+    it("injects overlapping submit messages into the next tool-loop step", async () => {
+      const room = crypto.randomUUID();
+      const { ws } = await connectWS("LoopToolTestAgent", room);
+      const agent = await getAgentByName(env.LoopToolTestAgent, room);
+
+      await collectMessages(ws, 3);
+
+      const first = sendChatRequest(ws, "wait-for-steering");
+      await waitForRequestChunk(ws, first.id, 15000);
+
+      const steering = sendChatRequest(ws, "steer-now");
+      await waitForRequestDone(ws, steering.id, 15000);
+      await waitForRequestDone(ws, first.id, 15000);
+      await collectMessages(ws, 1, 3000);
+
+      const msgs = (await (
+        agent as unknown as { getMessages(): Promise<UIMessage[]> }
+      ).getMessages()) as UIMessage[];
+
+      expect(msgs.filter((m) => m.role === "user")).toHaveLength(2);
+
+      const assistantMsg = msgs.find((m) => m.role === "assistant");
+      expect(assistantMsg).toBeDefined();
+      const assistantText = assistantMsg!.parts
+        .filter(
+          (
+            part
+          ): part is UIMessage["parts"][number] & {
+            type: "text";
+            text: string;
+          } => part.type === "text" && "text" in part
+        )
+        .map((part) => part.text)
+        .join("");
+      expect(assistantText).toContain("steered");
+
+      await closeWS(ws);
+    });
+
+    it("steers saveMessages into the next tool-loop step when requested", async () => {
+      const room = crypto.randomUUID();
+      const { ws } = await connectWS("LoopToolTestAgent", room);
+      const agent = await getAgentByName(env.LoopToolTestAgent, room);
+
+      await collectMessages(ws, 3);
+
+      const first = sendChatRequest(ws, "wait-for-steering");
+      await waitForRequestChunk(ws, first.id, 15000);
+
+      const steering = (await (
+        agent as unknown as {
+          testSaveMessages(
+            text: string,
+            concurrency?: "steer" | "followUp"
+          ): Promise<{ requestId: string; status: "completed" | "skipped" }>;
+        }
+      ).testSaveMessages("steer-now", "steer")) as {
+        requestId: string;
+        status: "completed" | "skipped";
+      };
+
+      expect(steering.status).toBe("completed");
+
+      await waitForRequestDone(ws, steering.requestId, 15000);
+      await waitForRequestDone(ws, first.id, 15000);
+      await collectMessages(ws, 1, 3000);
+
+      const msgs = (await (
+        agent as unknown as { getMessages(): Promise<UIMessage[]> }
+      ).getMessages()) as UIMessage[];
+
+      expect(msgs.filter((m) => m.role === "user")).toHaveLength(2);
+
+      const assistantMsg = msgs.find((m) => m.role === "assistant");
+      expect(assistantMsg).toBeDefined();
+      const assistantText = assistantMsg!.parts
+        .filter(
+          (
+            part
+          ): part is UIMessage["parts"][number] & {
+            type: "text";
+            text: string;
+          } => part.type === "text" && "text" in part
+        )
+        .map((part) => part.text)
+        .join("");
+      expect(assistantText).toContain("steered");
 
       await closeWS(ws);
     });

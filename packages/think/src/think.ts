@@ -240,7 +240,6 @@ export type {
   ChatRecoveryContext,
   ChatRecoveryOptions,
   MessageConcurrency,
-  SaveMessagesOptions,
   SaveMessagesResult
 } from "agents/chat";
 import type {
@@ -248,9 +247,22 @@ import type {
   ChatRecoveryContext,
   ChatRecoveryOptions,
   MessageConcurrency,
-  SaveMessagesOptions,
+  SaveMessagesOptions as BaseSaveMessagesOptions,
   SaveMessagesResult
 } from "agents/chat";
+
+export type SaveMessagesConcurrency = "steer" | "followUp";
+
+export interface SaveMessagesOptions extends BaseSaveMessagesOptions {
+  /**
+   * How to deliver programmatically saved messages when a turn is already in flight.
+   *
+   * - `"steer"`: inject between tool-loop steps when possible, otherwise fall back
+   *   to a follow-up turn after the current loop finishes.
+   * - `"followUp"`: always wait for the active turn to finish before running.
+   */
+  concurrency?: SaveMessagesConcurrency;
+}
 
 // ── Lifecycle hook types ────────────────────────────────────────
 
@@ -522,6 +534,12 @@ export interface ExtensionConfig {
 
 const TIMED_OUT = Symbol("timed-out");
 
+type PendingSteeringMessage = {
+  requestId: string;
+  uiMessages: UIMessage[];
+  modelMessages: ModelMessage[];
+};
+
 /**
  * An opinionated chat agent base class.
  *
@@ -657,6 +675,7 @@ export class Think<
   private _insideResponseHook = false;
   private _insideInferenceLoop = false;
   private _pendingInteractionPromise: Promise<boolean> | null = null;
+  private _pendingSteeringMessages: PendingSteeringMessage[] = [];
   private _submitConcurrency = new SubmitConcurrencyController({
     defaultDebounceMs: Think.MESSAGE_DEBOUNCE_MS
   });
@@ -1205,6 +1224,23 @@ export class Think<
     const finalTools: ToolSet = this._wrapToolsWithDecision(mergedTools);
     const finalMaxSteps = config.maxSteps ?? this.maxSteps;
     const finalSendReasoning = config.sendReasoning ?? this.sendReasoning;
+    const deliveredSteeringMessages: ModelMessage[] = [];
+
+    const drainPendingSteeringMessages = async (): Promise<
+      PendingSteeringMessage[]
+    > => {
+      if (this._pendingSteeringMessages.length === 0) return [];
+      const pending = this._pendingSteeringMessages.splice(0);
+      for (const entry of pending) {
+        for (const msg of entry.uiMessages) await this.session.appendMessage(msg);
+      }
+      this._broadcastMessages();
+      deliveredSteeringMessages.push(...pending.flatMap((entry) => entry.modelMessages));
+      for (const entry of pending) {
+        this._broadcastChat({ type: MSG_CHAT_RESPONSE, id: entry.requestId, body: "", done: true });
+      }
+      return pending;
+    };
 
     const result = streamText({
       model: finalModel,
@@ -1223,24 +1259,28 @@ export class Think<
       // on the terminal turn without dropping tools at model construction.
       output: config.output,
       abortSignal: input.signal,
-      // Forward the AI SDK's `prepareStep` callback unchanged so subclasses
-      // can make per-step decisions from the previous steps, current
-      // messages, model, and experimental context.
-      //
-      // Subclass-only by design: extension dispatch is intentionally not
-      // wired here. The prepareStep event includes a live `LanguageModel`
-      // instance which is not JSON-serializable, and a returned override
-      // can include the same — there's no useful "snapshot, override"
-      // contract we could give to sandboxed extensions. If we expose
-      // observation-only later it should go through a separate,
-      // serialized event surface.
-      //
-      // `beforeStep` returning `void`/`undefined`/`null` is normalized to
-      // `{}` so the AI SDK falls back to top-level settings (it accepts
-      // `undefined` per docs but the typed return is non-null).
+      // Forward the AI SDK's `prepareStep` callback while first draining any
+      // queued steering messages into the next step's prompt.
       prepareStep: (async (event) => {
-        const result = await this.beforeStep(event);
-        return result == null ? {} : result;
+        await drainPendingSteeringMessages();
+        const stepEvent =
+          deliveredSteeringMessages.length === 0
+            ? event
+            : {
+                ...event,
+                messages: [...event.messages, ...deliveredSteeringMessages]
+              };
+
+        const result = await this.beforeStep(stepEvent);
+        if (result == null) {
+          return deliveredSteeringMessages.length === 0
+            ? {}
+            : { messages: stepEvent.messages };
+        }
+
+        return deliveredSteeringMessages.length > 0 && result.messages == null
+          ? { ...result, messages: stepEvent.messages }
+          : result;
       }) satisfies PrepareStepFunction<ToolSet>,
       onChunk: async (event) => {
         // Pass the AI SDK's chunk event through unchanged — gives users
@@ -2105,6 +2145,14 @@ export class Think<
    * Pre-aborted signals short-circuit before any model work runs. See
    * {@link SaveMessagesOptions} for the integration point.
    *
+   * Use `options.concurrency` to control how overlapping calls behave while
+   * an agent loop is already running:
+   *
+   * - `"steer"`: queue the messages for delivery at the next step boundary,
+   *   after the current tool execution finishes and before the next LLM call.
+   *   If no next step exists, the messages fall back to a normal follow-up turn.
+   * - `"followUp"`: always wait for the current loop to finish before running.
+   *
    * @example Scheduled follow-up
    * ```typescript
    * async onScheduled() {
@@ -2114,6 +2162,13 @@ export class Think<
    *     parts: [{ type: "text", text: "Time for your daily summary." }]
    *   }]);
    * }
+   * ```
+   *
+   * @example Steering into the next step
+   * ```typescript
+   * await this.saveMessages([
+   *   { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text: "Actually, summarize it." }] }
+   * ], { concurrency: "steer" });
    * ```
    *
    * @example Function form
@@ -2141,78 +2196,101 @@ export class Think<
     const clientTools = this._lastClientTools;
     const body = this._lastBody;
     const epoch = this._turnQueue.generation;
+    const concurrency = options?.concurrency ?? "followUp";
     let status: SaveMessagesResult["status"] = "completed";
     let wasAborted = false;
 
-    await this.keepAliveWhile(async () => {
-      await this._turnQueue.enqueue(requestId, async () => {
-        const resolved =
-          typeof messages === "function"
-            ? await messages(this.messages)
-            : messages;
+    const resolveMessages = async (): Promise<UIMessage[]> =>
+      typeof messages === "function" ? await messages(this.messages) : messages;
 
-        if (this._turnQueue.generation !== epoch) {
-          status = "skipped";
-          return;
-        }
+    const runSavedTurn = async (resolved: UIMessage[]): Promise<void> => {
+      if (this._turnQueue.generation !== epoch) {
+        status = "skipped";
+        return;
+      }
 
-        for (const msg of resolved) {
-          await this.session.appendMessage(msg);
-        }
-        this._broadcastMessages();
+      for (const msg of resolved) {
+        await this.session.appendMessage(msg);
+      }
+      this._broadcastMessages();
 
-        if (this._turnQueue.generation !== epoch) {
-          status = "skipped";
-          return;
-        }
+      if (this._turnQueue.generation !== epoch) {
+        status = "skipped";
+        return;
+      }
 
-        const abortSignal = this._aborts.getSignal(requestId);
-        // Wire the optional external signal to the registry's controller
-        // for this request. Detacher MUST run in `finally` to avoid
-        // leaking listeners on a long-lived parent signal that drives
-        // many helper turns.
-        const detachExternal = this._aborts.linkExternal(
-          requestId,
-          options?.signal
-        );
-        try {
-          const programmaticBody = async () => {
-            const result = await agentContext.run(
-              {
-                agent: this,
-                connection: undefined,
-                request: undefined,
-                email: undefined
-              },
-              () =>
-                this._runInferenceLoop({
-                  signal: abortSignal,
-                  clientTools,
-                  body,
-                  continuation: false
-                })
-            );
+      const abortSignal = this._aborts.getSignal(requestId);
+      // Wire the optional external signal to the registry's controller
+      // for this request. Detacher MUST run in `finally` to avoid
+      // leaking listeners on a long-lived parent signal that drives
+      // many helper turns.
+      const detachExternal = this._aborts.linkExternal(
+        requestId,
+        options?.signal
+      );
+      try {
+        const programmaticBody = async () => {
+          const result = await agentContext.run(
+            {
+              agent: this,
+              connection: undefined,
+              request: undefined,
+              email: undefined
+            },
+            () =>
+              this._runInferenceLoop({
+                signal: abortSignal,
+                clientTools,
+                body,
+                continuation: false
+              })
+          );
 
-            if (result) {
-              await this._streamResult(requestId, result, abortSignal);
-            }
-          };
-
-          if (this.chatRecovery) {
-            await this.runFiber(
-              `${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${requestId}`,
-              async () => {
-                await programmaticBody();
-              }
-            );
-          } else {
-            await programmaticBody();
+          if (result) {
+            await this._streamResult(requestId, result, abortSignal);
           }
-        } finally {
-          if (abortSignal?.aborted) wasAborted = true;
-          detachExternal();
-          this._aborts.remove(requestId);
+        };
+
+        if (this.chatRecovery) {
+          await this.runFiber(
+            `${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${requestId}`,
+            async () => {
+              await programmaticBody();
+            }
+          );
+        } else {
+          await programmaticBody();
         }
+      } finally {
+        if (abortSignal?.aborted) wasAborted = true;
+        detachExternal();
+        this._aborts.remove(requestId);
+      }
+    };
+
+    await this.keepAliveWhile(async () => {
+      if (concurrency === "steer") {
+        const resolved = await resolveMessages();
+
+        if (this._turnQueue.generation !== epoch) {
+          status = "skipped";
+          return;
+        }
+
+        if (this._insideInferenceLoop) {
+          await this._queueSteeringMessages(requestId, resolved);
+          return;
+        }
+
+        await this._turnQueue.enqueue(requestId, async () => {
+          await runSavedTurn(resolved);
+        });
+        return;
+      }
+
+      await this._turnQueue.enqueue(requestId, async () => {
+        const resolved = await resolveMessages();
+        await runSavedTurn(resolved);
       });
     });
 
@@ -2480,6 +2558,75 @@ export class Think<
     }
   }
 
+  private async _queueSteeringMessages(
+    requestId: string,
+    messages: UIMessage[]
+  ): Promise<void> {
+    const modelMessages = await convertToModelMessages(messages);
+    this._pendingSteeringMessages.push({
+      requestId,
+      uiMessages: messages,
+      modelMessages
+    });
+  }
+
+  private async _flushPendingSteeringTurns(): Promise<void> {
+    while (this._pendingSteeringMessages.length > 0) {
+      const pending = this._pendingSteeringMessages.shift();
+      if (!pending) {
+        return;
+      }
+
+      const abortSignal = this._aborts.getSignal(pending.requestId);
+
+      try {
+        await this._turnQueue.enqueue(pending.requestId, async () => {
+          for (const msg of pending.uiMessages) {
+            await this.session.appendMessage(msg);
+          }
+          this._broadcastMessages();
+
+          const result = await agentContext.run(
+            {
+              agent: this,
+              connection: undefined,
+              request: undefined,
+              email: undefined
+            },
+            () =>
+              this._runInferenceLoop({
+                signal: abortSignal,
+                clientTools: this._lastClientTools,
+                body: this._lastBody,
+                continuation: false
+              })
+          );
+
+          if (result) {
+            await this._streamResult(pending.requestId, result, abortSignal);
+          } else {
+            this._broadcastChat({
+              type: MSG_CHAT_RESPONSE,
+              id: pending.requestId,
+              body: "No response was generated.",
+              done: true
+            });
+          }
+        });
+      } catch (error) {
+        this._broadcastChat({
+          type: MSG_CHAT_RESPONSE,
+          id: pending.requestId,
+          body: error instanceof Error ? error.message : "Error",
+          done: true,
+          error: true
+        });
+      } finally {
+        this._aborts.remove(pending.requestId);
+      }
+    }
+  }
+
   private _handleStreamResumeRequest(connection: Connection): void {
     if (this._resumableStream.hasActiveStream()) {
       if (
@@ -2564,8 +2711,24 @@ export class Think<
       return;
     }
 
+    const requestClientTools =
+      rawClientTools && rawClientTools.length > 0 ? rawClientTools : undefined;
+    const requestBody =
+      Object.keys(customBody).length > 0 ? customBody : undefined;
+
+    if (
+      isSubmitMessage &&
+      this._insideInferenceLoop &&
+      requestClientTools === undefined &&
+      requestBody === undefined
+    ) {
+      await this._queueSteeringMessages(requestId, incomingMessages);
+      return;
+    }
+
     const releasePendingEnqueue = this._submitConcurrency.beginEnqueue();
     let pendingEnqueue = true;
+    const abortSignal = this._aborts.getSignal(requestId);
     const epoch = this._turnQueue.generation;
     const releaseIfPending = () => {
       if (!pendingEnqueue) return;
@@ -2732,6 +2895,8 @@ export class Think<
             done: true
           });
         }
+
+        await this._flushPendingSteeringTurns();
       });
     } catch (error) {
       this._broadcastChat({
@@ -2758,6 +2923,7 @@ export class Think<
   protected resetTurnState(): void {
     this._turnQueue.reset();
     this._aborts.destroyAll();
+    this._pendingSteeringMessages = [];
     if (this._continuationTimer) {
       clearTimeout(this._continuationTimer);
       this._continuationTimer = null;

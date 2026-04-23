@@ -10,11 +10,13 @@ import { tool } from "ai";
 import { z } from "zod";
 import { Think } from "../../think";
 import type {
+  SaveMessagesConcurrency,
+  SaveMessagesResult,
+  StepContext,
   StreamCallback,
   ToolCallContext,
   ToolCallDecision,
-  ToolCallResultContext,
-  StepContext
+  ToolCallResultContext
 } from "../../think";
 
 type TestChatResult = {
@@ -114,15 +116,18 @@ function createMockToolModel(): LanguageModel {
     doStream(options: Record<string, unknown>) {
       toolCallCount++;
       const messages = (options as { prompt?: unknown[] }).prompt ?? [];
+      const promptJson = JSON.stringify(messages);
       const hasToolResult = messages.some(
         (m: unknown) =>
           typeof m === "object" &&
           m !== null &&
           (m as Record<string, unknown>).role === "tool"
       );
+      const shouldPauseForSteering = promptJson.includes("wait-for-steering");
+      const sawSteeringMessage = promptJson.includes("steer-now");
 
       const stream = new ReadableStream({
-        start(controller) {
+        async start(controller) {
           controller.enqueue({ type: "stream-start", warnings: [] });
 
           if (!hasToolResult && toolCallCount === 1) {
@@ -148,6 +153,9 @@ function createMockToolModel(): LanguageModel {
               toolName: "echo",
               input: JSON.stringify({ message: "ping" })
             });
+            if (shouldPauseForSteering) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
             controller.enqueue({
               type: "finish",
               finishReason: v3FinishReason("tool-calls"),
@@ -161,7 +169,9 @@ function createMockToolModel(): LanguageModel {
             controller.enqueue({
               type: "text-delta",
               id: "t2",
-              delta: "Tool said: pong"
+              delta: sawSteeringMessage
+                ? "Tool said: pong (steered)"
+                : "Tool said: pong"
             });
             controller.enqueue({
               type: "text-end",
@@ -302,5 +312,21 @@ export class LoopToolTestAgent extends Think {
     }>
   > {
     return this._afterToolCallLog;
+  }
+
+  async testSaveMessages(
+    text: string,
+    concurrency?: SaveMessagesConcurrency
+  ): Promise<SaveMessagesResult> {
+    return this.saveMessages(
+      [
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          parts: [{ type: "text", text }]
+        }
+      ],
+      concurrency ? { concurrency } : undefined
+    );
   }
 }
