@@ -124,13 +124,34 @@ function createMockToolModel(): LanguageModel {
           (m as Record<string, unknown>).role === "tool"
       );
       const shouldPauseForSteering = promptJson.includes("wait-for-steering");
+      const shouldStopBeforeSteering = promptJson.includes(
+        "stop-before-steering"
+      );
       const sawSteeringMessage = promptJson.includes("steer-now");
 
       const stream = new ReadableStream({
         async start(controller) {
           controller.enqueue({ type: "stream-start", warnings: [] });
 
-          if (!hasToolResult && toolCallCount === 1) {
+          if (shouldStopBeforeSteering) {
+            controller.enqueue({ type: "text-start", id: "stop-text" });
+            controller.enqueue({
+              type: "text-delta",
+              id: "stop-text",
+              delta: sawSteeringMessage
+                ? "Follow-up processed steer-now"
+                : "Initial stopped before steering"
+            });
+            if (!sawSteeringMessage) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            controller.enqueue({ type: "text-end", id: "stop-text" });
+            controller.enqueue({
+              type: "finish",
+              finishReason: v3FinishReason("stop"),
+              usage: v3Usage(10, 5)
+            });
+          } else if (!hasToolResult && toolCallCount === 1) {
             controller.enqueue({
               type: "tool-input-start",
               id: "tc1",
@@ -328,5 +349,20 @@ export class LoopToolTestAgent extends Think {
       ],
       concurrency ? { concurrency } : undefined
     );
+  }
+
+  async testProgrammaticSteerWhenLoopStops(): Promise<UIMessage[]> {
+    let steeringPromise: Promise<SaveMessagesResult> | undefined;
+    const cb: StreamCallback = {
+      onEvent: () => {
+        steeringPromise ??= this.testSaveMessages("steer-now", "steer");
+      },
+      onDone: () => {},
+      onError: () => {}
+    };
+
+    await this.chat("stop-before-steering", cb);
+    await steeringPromise;
+    return this.messages;
   }
 }

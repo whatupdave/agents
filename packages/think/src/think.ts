@@ -676,6 +676,7 @@ export class Think<
   private _insideInferenceLoop = false;
   private _pendingInteractionPromise: Promise<boolean> | null = null;
   private _pendingSteeringMessages: PendingSteeringMessage[] = [];
+  private _flushingPendingSteeringTurns = false;
   private _submitConcurrency = new SubmitConcurrencyController({
     defaultDebounceMs: Think.MESSAGE_DEBOUNCE_MS
   });
@@ -1232,12 +1233,20 @@ export class Think<
       if (this._pendingSteeringMessages.length === 0) return [];
       const pending = this._pendingSteeringMessages.splice(0);
       for (const entry of pending) {
-        for (const msg of entry.uiMessages) await this.session.appendMessage(msg);
+        for (const msg of entry.uiMessages)
+          await this.session.appendMessage(msg);
       }
       this._broadcastMessages();
-      deliveredSteeringMessages.push(...pending.flatMap((entry) => entry.modelMessages));
+      deliveredSteeringMessages.push(
+        ...pending.flatMap((entry) => entry.modelMessages)
+      );
       for (const entry of pending) {
-        this._broadcastChat({ type: MSG_CHAT_RESPONSE, id: entry.requestId, body: "", done: true });
+        this._broadcastChat({
+          type: MSG_CHAT_RESPONSE,
+          id: entry.requestId,
+          body: "",
+          done: true
+        });
       }
       return pending;
     };
@@ -1863,6 +1872,8 @@ export class Think<
         }
       }
     });
+
+    await this._flushPendingSteeringTurns();
   }
 
   // ── Message access ──────────────────────────────────────────────
@@ -2199,6 +2210,7 @@ export class Think<
     const concurrency = options?.concurrency ?? "followUp";
     let status: SaveMessagesResult["status"] = "completed";
     let wasAborted = false;
+    let queuedForSteering = false;
 
     const resolveMessages = async (): Promise<UIMessage[]> =>
       typeof messages === "function" ? await messages(this.messages) : messages;
@@ -2279,6 +2291,7 @@ export class Think<
 
         if (this._insideInferenceLoop) {
           await this._queueSteeringMessages(requestId, resolved);
+          queuedForSteering = true;
           return;
         }
 
@@ -2293,6 +2306,10 @@ export class Think<
         await runSavedTurn(resolved);
       });
     });
+
+    if (!queuedForSteering) {
+      await this._flushPendingSteeringTurns();
+    }
 
     if (this._turnQueue.generation !== epoch && status === "completed") {
       status = "skipped";
@@ -2571,59 +2588,68 @@ export class Think<
   }
 
   private async _flushPendingSteeringTurns(): Promise<void> {
-    while (this._pendingSteeringMessages.length > 0) {
-      const pending = this._pendingSteeringMessages.shift();
-      if (!pending) {
-        return;
+    if (this._flushingPendingSteeringTurns) {
+      return;
+    }
+
+    this._flushingPendingSteeringTurns = true;
+    try {
+      while (this._pendingSteeringMessages.length > 0) {
+        const pending = this._pendingSteeringMessages.shift();
+        if (!pending) {
+          return;
+        }
+
+        const abortSignal = this._aborts.getSignal(pending.requestId);
+
+        try {
+          await this._turnQueue.enqueue(pending.requestId, async () => {
+            for (const msg of pending.uiMessages) {
+              await this.session.appendMessage(msg);
+            }
+            this._broadcastMessages();
+
+            const result = await agentContext.run(
+              {
+                agent: this,
+                connection: undefined,
+                request: undefined,
+                email: undefined
+              },
+              () =>
+                this._runInferenceLoop({
+                  signal: abortSignal,
+                  clientTools: this._lastClientTools,
+                  body: this._lastBody,
+                  continuation: false
+                })
+            );
+
+            if (result) {
+              await this._streamResult(pending.requestId, result, abortSignal);
+            } else {
+              this._broadcastChat({
+                type: MSG_CHAT_RESPONSE,
+                id: pending.requestId,
+                body: "No response was generated.",
+                done: true
+              });
+            }
+          });
+        } catch (error) {
+          this._broadcastChat({
+            type: MSG_CHAT_RESPONSE,
+            id: pending.requestId,
+            body: error instanceof Error ? error.message : "Error",
+            done: true,
+            error: true
+          });
+        } finally {
+          this._aborts.remove(pending.requestId);
+        }
       }
-
-      const abortSignal = this._aborts.getSignal(pending.requestId);
-
-      try {
-        await this._turnQueue.enqueue(pending.requestId, async () => {
-          for (const msg of pending.uiMessages) {
-            await this.session.appendMessage(msg);
-          }
-          this._broadcastMessages();
-
-          const result = await agentContext.run(
-            {
-              agent: this,
-              connection: undefined,
-              request: undefined,
-              email: undefined
-            },
-            () =>
-              this._runInferenceLoop({
-                signal: abortSignal,
-                clientTools: this._lastClientTools,
-                body: this._lastBody,
-                continuation: false
-              })
-          );
-
-          if (result) {
-            await this._streamResult(pending.requestId, result, abortSignal);
-          } else {
-            this._broadcastChat({
-              type: MSG_CHAT_RESPONSE,
-              id: pending.requestId,
-              body: "No response was generated.",
-              done: true
-            });
-          }
-        });
-      } catch (error) {
-        this._broadcastChat({
-          type: MSG_CHAT_RESPONSE,
-          id: pending.requestId,
-          body: error instanceof Error ? error.message : "Error",
-          done: true,
-          error: true
-        });
-      } finally {
-        this._aborts.remove(pending.requestId);
-      }
+    } finally {
+      this._flushingPendingSteeringTurns = false;
     }
   }
 
@@ -2728,7 +2754,6 @@ export class Think<
 
     const releasePendingEnqueue = this._submitConcurrency.beginEnqueue();
     let pendingEnqueue = true;
-    const abortSignal = this._aborts.getSignal(requestId);
     const epoch = this._turnQueue.generation;
     const releaseIfPending = () => {
       if (!pendingEnqueue) return;

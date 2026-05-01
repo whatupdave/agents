@@ -389,6 +389,36 @@ describe("Think — agentic loop", () => {
 
       await closeWS(ws);
     });
+
+    it("runs a follow-up turn for programmatic steering when the active loop stops first", async () => {
+      const room = crypto.randomUUID();
+      const agent = await getAgentByName(env.LoopToolTestAgent, room);
+
+      const msgs = (await (
+        agent as unknown as {
+          testProgrammaticSteerWhenLoopStops(): Promise<UIMessage[]>;
+        }
+      ).testProgrammaticSteerWhenLoopStops()) as UIMessage[];
+
+      expect(msgs.filter((m) => m.role === "user")).toHaveLength(2);
+
+      const assistantText = msgs
+        .filter((m) => m.role === "assistant")
+        .flatMap((m) => m.parts)
+        .filter(
+          (
+            part
+          ): part is UIMessage["parts"][number] & {
+            type: "text";
+            text: string;
+          } => part.type === "text" && "text" in part
+        )
+        .map((part) => part.text)
+        .join("\n");
+
+      expect(assistantText).toContain("Initial stopped before steering");
+      expect(assistantText).toContain("Follow-up processed steer-now");
+    });
   });
 
   describe("context assembly", () => {
