@@ -90,6 +90,19 @@ possible:
 - the message arrives after the model's final step has started streaming
 - any message is not `role: "user"`, or the function form was used
 
+When the message only makes sense against the running turn — a watchdog
+redirecting work in progress, for example — pass `steer: "require"`
+instead. If steering is not possible, the messages are not persisted and
+the call resolves immediately with `{ requestId: "", status: "skipped" }`
+rather than running a stale standalone turn:
+
+```typescript
+const result = await agent.saveMessages([redirectMsg], { steer: "require" });
+if (!result.steered) {
+  // Turn already ended — the redirect was dropped.
+}
+```
+
 A `chat:steered` observability event is emitted whenever messages are folded
 into an active turn.
 

@@ -152,6 +152,39 @@ export class SteeringTestAgent extends Think {
     return this._summarize(turn, steer);
   }
 
+  /**
+   * `steer: "require"` while the final text step is streaming — past the
+   * last prepareStep, so the entry is dropped: no fallback turn, message
+   * never persisted, resolves `skipped`.
+   */
+  async runPostFinalStepRequireSteer(): Promise<SteeringRunSummary> {
+    this._reset("gated-text");
+    const streamStarted = new Promise<void>((resolve) => {
+      this._streamStarted = resolve;
+    });
+    const turnPromise = this.saveMessages([
+      userMessage("create a calendar block at 2pm")
+    ]);
+    await streamStarted;
+    const steerPromise = this.saveMessages(
+      [userMessage("actually make it 3pm")],
+      { steer: "require" }
+    );
+    this._streamGate?.();
+    const [turn, steer] = await Promise.all([turnPromise, steerPromise]);
+    return this._summarize(turn, steer);
+  }
+
+  /** `steer: "require"` with no turn active — dropped, nothing persisted. */
+  async runIdleRequireSteer(): Promise<SteeringRunSummary> {
+    this._reset("gated-text");
+    const steer = await this.saveMessages(
+      [userMessage("actually make it 3pm")],
+      { steer: "require" }
+    );
+    return this._summarize(steer, steer);
+  }
+
   /** Steer with no turn active — must behave exactly like saveMessages. */
   async runIdleSteer(): Promise<SteeringRunSummary> {
     this._reset("gated-text");

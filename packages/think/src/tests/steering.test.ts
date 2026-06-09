@@ -107,6 +107,30 @@ describe("Think — saveMessages steering", () => {
     expect(run.roles).toEqual(["user", "assistant", "user", "assistant"]);
   });
 
+  it('drops a steer:"require" call that misses the active turn', async () => {
+    const agent = await freshSteeringAgent("steer-require-post-final");
+    const run = await agent.runPostFinalStepRequireSteer();
+
+    // Only the host turn's model call — no fallback turn ran, and the
+    // steered message was never persisted.
+    expect(run.prompts).toHaveLength(1);
+    expect(run.turn.status).toBe("completed");
+    expect(run.steer.status).toBe("skipped");
+    expect(run.steer.requestId).toBe("");
+    expect(run.steer.steered).toBeUndefined();
+    expect(run.roles).toEqual(["user", "assistant"]);
+  });
+
+  it('drops a steer:"require" call when no turn is active', async () => {
+    const agent = await freshSteeringAgent("steer-require-idle");
+    const run = await agent.runIdleRequireSteer();
+
+    expect(run.prompts).toHaveLength(0);
+    expect(run.steer.status).toBe("skipped");
+    expect(run.steer.requestId).toBe("");
+    expect(run.roles).toEqual([]);
+  });
+
   it("behaves like a normal saveMessages call when no turn is active", async () => {
     const agent = await freshSteeringAgent("steer-idle");
     const run = await agent.runIdleSteer();

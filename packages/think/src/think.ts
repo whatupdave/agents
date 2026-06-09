@@ -594,6 +594,12 @@ type SteeringEntry = {
   messages: UIMessage[];
   /** Turn-queue generation at acceptance; a bump (chat clear) voids the entry. */
   epoch: number;
+  /**
+   * `"require"` entries are steer-or-drop: if the host turn ends before
+   * they reach a step boundary they settle as `"skipped"` instead of
+   * falling back to their own queued turn.
+   */
+  steer: true | "require";
   signal?: AbortSignal;
   /** Resolves the steering caller's `saveMessages` promise. Idempotent. */
   settle: (result: ThinkSaveMessagesResult) => void;
@@ -1213,13 +1219,20 @@ export interface ThinkSaveMessagesOptions extends SaveMessagesOptions {
    * resolves when that host turn finishes, mirroring its status, with
    * `steered: true` on the result.
    *
-   * Falls back to the normal queued-turn behavior (and `steered` stays
-   * unset) when steering is not possible: no turn is active, the active
-   * turn is a structured workflow turn, the messages arrived after the
-   * model's final step, any message is not `role: "user"`, or the
-   * function form of `saveMessages` was used.
+   * Steering is not possible when: no turn is active, the active turn is
+   * a structured workflow turn, the messages arrived after the model's
+   * final step, any message is not `role: "user"`, or the function form
+   * of `saveMessages` was used. What happens then depends on the value:
+   *
+   * - `true` — fall back to the normal queued-turn behavior (`steered`
+   *   stays unset).
+   * - `"require"` — do nothing: the messages are not persisted and no
+   *   turn runs; the call resolves immediately with
+   *   `{ requestId: "", status: "skipped" }`. Use this when the message
+   *   only makes sense against the running turn (e.g. a watchdog
+   *   redirecting work in progress) and would be stale as its own turn.
    */
-  steer?: boolean;
+  steer?: boolean | "require";
 }
 
 /** Result of a {@link Think.saveMessages} call. */
@@ -6437,6 +6450,12 @@ export class Think<
     if (options?.steer) {
       const steered = this._trySteerActiveTurn(messages, options);
       if (steered) return steered;
+      // `"require"` means steer-or-drop: the messages only make sense
+      // against the turn that is (was) running, so a missed window must not
+      // spawn a stale standalone turn.
+      if (options.steer === "require") {
+        return { requestId: "", status: "skipped" };
+      }
     }
     const requestId = crypto.randomUUID();
     return this._runProgrammaticMessagesTurn(requestId, messages, options);
@@ -6494,6 +6513,7 @@ export class Think<
     const entry: SteeringEntry = {
       messages,
       epoch,
+      steer: options?.steer === "require" ? "require" : true,
       signal: options?.signal,
       settle
     };
@@ -6532,7 +6552,10 @@ export class Think<
 
   /** Run an undrained steering entry as its own queued turn. */
   private _dispatchSteeringFallback(entry: SteeringEntry): void {
-    if (entry.epoch !== this._turnQueue.generation) {
+    if (
+      entry.steer === "require" ||
+      entry.epoch !== this._turnQueue.generation
+    ) {
       entry.settle({ requestId: "", status: "skipped" });
       return;
     }
