@@ -43,21 +43,31 @@ type SteeringRunSummary = {
   secondSteer?: ThinkSaveMessagesResult;
   /** Roles of persisted history, in order. */
   roles: string[];
+  /** Message ids per onMessagesSteered invocation, in order. */
+  steeredBatches: string[][];
 };
 
 export class SteeringTestAgent extends Think {
-  private _mode: "tool-then-text" | "gated-text" = "tool-then-text";
+  private _mode: "tool-then-text" | "two-tools-then-text" | "gated-text" =
+    "tool-then-text";
   private _modelCalls = 0;
   private _prompts: string[] = [];
   private _toolStarted: (() => void) | null = null;
   private _toolGate: (() => void) | null = null;
   private _streamStarted: (() => void) | null = null;
   private _streamGate: (() => void) | null = null;
+  private _steeredBatches: string[][] = [];
 
   getModel(): LanguageModel {
-    return this._mode === "tool-then-text"
-      ? this._createToolThenTextModel()
-      : this._createGatedTextModel();
+    return this._mode === "gated-text"
+      ? this._createGatedTextModel()
+      : this._createToolThenTextModel(
+          this._mode === "two-tools-then-text" ? 2 : 1
+        );
+  }
+
+  onMessagesSteered(messages: UIMessage[]): void {
+    this._steeredBatches.push(messages.map((message) => message.id));
   }
 
   getTools(): ToolSet {
@@ -121,6 +131,65 @@ export class SteeringTestAgent extends Think {
       { steer: true }
     );
     this._toolGate?.();
+    const [turn, steer, secondSteer] = await Promise.all([
+      turnPromise,
+      steerPromise,
+      secondSteerPromise
+    ]);
+    return { ...this._summarize(turn, steer), secondSteer };
+  }
+
+  /**
+   * Steer during the FIRST of two tool steps — the steered message drains
+   * at the next step boundary and must remain in the model's view on every
+   * later step, not just the one it was injected into (the AI SDK rebuilds
+   * each step's input from the turn's initial messages plus its own
+   * response messages, so a single-step override evaporates).
+   */
+  async runReinjectionSteer(): Promise<SteeringRunSummary> {
+    this._reset("two-tools-then-text");
+    const toolStarted = new Promise<void>((resolve) => {
+      this._toolStarted = resolve;
+    });
+    const turnPromise = this.saveMessages([
+      userMessage("create a calendar block at 2pm")
+    ]);
+    await toolStarted;
+    const steerPromise = this.saveMessages(
+      [userMessage("actually make it 3pm")],
+      { steer: true }
+    );
+    // The second tool execution releases itself — the steer is already
+    // drained by then; only the first gate needs deterministic timing.
+    this._toolStarted = () => this._toolGate?.();
+    this._toolGate?.();
+    const [turn, steer] = await Promise.all([turnPromise, steerPromise]);
+    return this._summarize(turn, steer);
+  }
+
+  /**
+   * Two steer calls while the final text step is already streaming — both
+   * miss the last prepareStep and must fall back as ONE combined queued
+   * turn, settling both with the shared result.
+   */
+  async runDoubleFallbackSteer(): Promise<SteeringRunSummary> {
+    this._reset("gated-text");
+    const streamStarted = new Promise<void>((resolve) => {
+      this._streamStarted = resolve;
+    });
+    const turnPromise = this.saveMessages([
+      userMessage("create a calendar block at 2pm")
+    ]);
+    await streamStarted;
+    const steerPromise = this.saveMessages(
+      [userMessage("actually make it 3pm")],
+      { steer: true }
+    );
+    const secondSteerPromise = this.saveMessages(
+      [userMessage("and title it standup")],
+      { steer: true }
+    );
+    this._streamGate?.();
     const [turn, steer, secondSteer] = await Promise.all([
       turnPromise,
       steerPromise,
@@ -221,7 +290,9 @@ export class SteeringTestAgent extends Think {
     return this._summarize(turn, steer);
   }
 
-  private _reset(mode: "tool-then-text" | "gated-text"): void {
+  private _reset(
+    mode: "tool-then-text" | "two-tools-then-text" | "gated-text"
+  ): void {
     this._mode = mode;
     this._modelCalls = 0;
     this._prompts = [];
@@ -229,6 +300,7 @@ export class SteeringTestAgent extends Think {
     this._toolGate = null;
     this._streamStarted = null;
     this._streamGate = null;
+    this._steeredBatches = [];
   }
 
   private _summarize(
@@ -239,7 +311,8 @@ export class SteeringTestAgent extends Think {
       prompts: this._prompts,
       turn,
       steer,
-      roles: this.messages.map((message) => message.role)
+      roles: this.messages.map((message) => message.role),
+      steeredBatches: this._steeredBatches
     };
   }
 
@@ -250,12 +323,12 @@ export class SteeringTestAgent extends Think {
   }
 
   /**
-   * Call 1: reasoning (with provider metadata, like OpenAI Responses
-   * reasoning items) followed by a `wait` tool call. Later calls: plain
-   * text. Keys off the model-call count so a steered second step does not
-   * change which step it is on.
+   * Calls 1..toolSteps: reasoning on the first call (with provider
+   * metadata, like OpenAI Responses reasoning items) followed by a `wait`
+   * tool call. Later calls: plain text. Keys off the model-call count so a
+   * steered second step does not change which step it is on.
    */
-  private _createToolThenTextModel(): LanguageModel {
+  private _createToolThenTextModel(toolSteps: number): LanguageModel {
     return {
       specificationVersion: "v3",
       provider: "test",
@@ -271,23 +344,25 @@ export class SteeringTestAgent extends Think {
         const stream = new ReadableStream({
           start(controller) {
             controller.enqueue({ type: "stream-start", warnings: [] });
-            if (currentCall === 1) {
-              controller.enqueue({ type: "reasoning-start", id: "r1" });
-              controller.enqueue({
-                type: "reasoning-delta",
-                id: "r1",
-                delta: "planning the calendar block"
-              });
-              controller.enqueue({
-                type: "reasoning-end",
-                id: "r1",
-                providerMetadata: {
-                  test: { itemId: "rs_1", signature: "sig-1" }
-                }
-              });
+            if (currentCall <= toolSteps) {
+              if (currentCall === 1) {
+                controller.enqueue({ type: "reasoning-start", id: "r1" });
+                controller.enqueue({
+                  type: "reasoning-delta",
+                  id: "r1",
+                  delta: "planning the calendar block"
+                });
+                controller.enqueue({
+                  type: "reasoning-end",
+                  id: "r1",
+                  providerMetadata: {
+                    test: { itemId: "rs_1", signature: "sig-1" }
+                  }
+                });
+              }
               controller.enqueue({
                 type: "tool-call",
-                toolCallId: "tc1",
+                toolCallId: `tc${currentCall}`,
                 toolName: "wait",
                 input: JSON.stringify({})
               });

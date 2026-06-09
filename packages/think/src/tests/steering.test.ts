@@ -88,6 +88,66 @@ describe("Think — saveMessages steering", () => {
     expect(run.roles).toEqual(["user", "user", "user", "assistant"]);
   });
 
+  it("keeps a steered message in the model's view on every later step", async () => {
+    const agent = await freshSteeringAgent("steer-reinjection");
+    const run = await agent.runReinjectionSteer();
+
+    // One turn, three model calls: tool, tool, final text. The steer drains
+    // at the boundary before call 2 — and must STILL be in call 3's prompt.
+    // The AI SDK rebuilds each step's input from the turn's initial messages
+    // plus its own response messages, so a single-step prepareStep override
+    // evaporates; the window re-appends injected messages every step.
+    expect(run.prompts).toHaveLength(3);
+    expect(JSON.stringify(userTexts(run.prompts[0]))).not.toContain("3pm");
+    expect(JSON.stringify(userTexts(run.prompts[1]))).toContain("3pm");
+    expect(JSON.stringify(userTexts(run.prompts[2]))).toContain("3pm");
+
+    // Injected once — re-appending must not duplicate it within a prompt.
+    const finalPromptUsers = userTexts(run.prompts[2]);
+    expect(
+      finalPromptUsers.filter((text) => text.includes("3pm"))
+    ).toHaveLength(1);
+
+    expect(run.steer.steered).toBe(true);
+    expect(run.steer.requestId).toBe(run.turn.requestId);
+    expect(run.roles).toEqual(["user", "user", "assistant"]);
+
+    // The hook fired once, inside the host turn, with the steered message.
+    expect(run.steeredBatches).toHaveLength(1);
+    expect(run.steeredBatches[0]).toHaveLength(1);
+  });
+
+  it("combines steers that miss the final step into one fallback turn", async () => {
+    const agent = await freshSteeringAgent("steer-batched-fallback");
+    const run = await agent.runDoubleFallbackSteer();
+
+    // Two model calls: the host turn, then ONE fallback turn carrying both
+    // leftover steers — not a turn per entry re-answering the same history.
+    expect(run.prompts).toHaveLength(2);
+    const fallbackUserTexts = JSON.stringify(userTexts(run.prompts[1]));
+    expect(fallbackUserTexts).toContain("3pm");
+    expect(fallbackUserTexts).toContain("standup");
+
+    expect(run.steer.status).toBe("completed");
+    expect(run.secondSteer?.status).toBe("completed");
+    expect(run.steer.steered).toBeUndefined();
+    expect(run.secondSteer?.steered).toBeUndefined();
+    expect(run.steer.requestId).toBe(run.secondSteer?.requestId);
+    expect(run.steer.requestId).not.toBe(run.turn.requestId);
+
+    // Nothing drained, so the hook never fired.
+    expect(run.steeredBatches).toHaveLength(0);
+
+    // [user 2pm, assistant, user 3pm, user standup, assistant].
+    expect(run.roles).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "user",
+      "assistant"
+    ]);
+  });
+
   it("falls back to a queued turn when the steer arrives after the final step", async () => {
     const agent = await freshSteeringAgent("steer-post-final");
     const run = await agent.runPostFinalStepSteer();

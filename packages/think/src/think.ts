@@ -610,6 +610,14 @@ type SteeringWindow = {
   pending: SteeringEntry[];
   /** Persisted and injected into the run; settled when the host turn ends. */
   drained: SteeringEntry[];
+  /**
+   * Model messages injected into the run so far. Re-appended on every
+   * subsequent step: the AI SDK rebuilds each step's input from the turn's
+   * initial messages plus the model's own response messages, so a
+   * single-step `prepareStep` override would silently evaporate at the
+   * next boundary and the model would forget the steered message.
+   */
+  injectedModelMessages: ModelMessage[];
 };
 
 type ChatRecoveryRetryData = {
@@ -1213,8 +1221,9 @@ export interface ThinkSaveMessagesOptions extends SaveMessagesOptions {
    * instead of queueing a separate turn behind it.
    *
    * When a steerable turn is active, the messages are persisted and
-   * injected at the next step boundary — the model sees them mid-turn,
-   * adjusts course, and produces a single response covering both the
+   * injected at the next step boundary — the model sees them mid-turn
+   * (and on every remaining step), adjusts course, and produces a single
+   * response covering both the
    * original request and the steered follow-up. The returned promise
    * resolves when that host turn finishes, mirroring its status, with
    * `steered: true` on the result.
@@ -1225,7 +1234,8 @@ export interface ThinkSaveMessagesOptions extends SaveMessagesOptions {
    * of `saveMessages` was used. What happens then depends on the value:
    *
    * - `true` — fall back to the normal queued-turn behavior (`steered`
-   *   stays unset).
+   *   stays unset). Steer calls left pending when the host turn ends are
+   *   combined into a single fallback turn rather than one turn each.
    * - `"require"` — do nothing: the messages are not persisted and no
    *   turn runs; the call resolves immediately with
    *   `{ requestId: "", status: "skipped" }`. Use this when the message
@@ -3053,6 +3063,15 @@ export class Think<
   onChatResponse(_result: ChatResponseResult): void | Promise<void> {}
 
   /**
+   * Called when steered messages (saveMessages with `steer`) are persisted
+   * and injected into the running turn at a step boundary. Runs inside the
+   * host turn, before the step that first sees the messages. Override to
+   * mark the in-flight turn as having absorbed the messages (e.g. so
+   * staleness checks don't discard its reply).
+   */
+  onMessagesSteered(_messages: UIMessage[]): void | Promise<void> {}
+
+  /**
    * Handle an error that occurred during a chat turn.
    * Override to customize error handling (e.g. logging, metrics).
    */
@@ -3650,7 +3669,13 @@ export class Think<
         // turns never take this branch.
         const steeredMessages = await this._drainSteeringIntoStep(
           ((withMessages as { messages?: ModelMessage[] }).messages ??
-            event.messages) as ModelMessage[]
+            event.messages) as ModelMessage[],
+          // When the guard's history-rebuilt head is this step's base, it
+          // already carries previously persisted steers.
+          {
+            baseIncludesPersistedSteers:
+              guarded !== undefined && baseMessages === undefined
+          }
         );
         if (steeredMessages) {
           return { ...withMessages, messages: steeredMessages };
@@ -6528,15 +6553,20 @@ export class Think<
    * (i.e. not structured workflow-prompt turns).
    */
   private _openSteeringWindow(): void {
-    this._steeringWindow = { pending: [], drained: [] };
+    this._steeringWindow = {
+      pending: [],
+      drained: [],
+      injectedModelMessages: []
+    };
   }
 
   /**
    * Close the active steering window: settle drained entries with the host
    * turn's outcome and hand entries that never reached a step boundary to
-   * normal queued turns. The window is nulled before anything else so a
+   * a queued fallback turn. The window is nulled before anything else so a
    * steer call racing this close falls back to queueing instead of landing
-   * in a dead window.
+   * in a dead window. Pending entries are taken off the window so a late
+   * abort can't settle an entry the fallback already owns.
    */
   private _closeSteeringWindow(outcome: SaveMessagesResult): void {
     const window = this._steeringWindow;
@@ -6545,42 +6575,51 @@ export class Think<
     for (const entry of window.drained) {
       entry.settle({ ...outcome, steered: true });
     }
-    for (const entry of window.pending) {
-      this._dispatchSteeringFallback(entry);
-    }
+    this._dispatchSteeringFallback(window.pending.splice(0));
   }
 
-  /** Run an undrained steering entry as its own queued turn. */
-  private _dispatchSteeringFallback(entry: SteeringEntry): void {
-    if (
-      entry.steer === "require" ||
-      entry.epoch !== this._turnQueue.generation
-    ) {
-      entry.settle({ requestId: "", status: "skipped" });
-      return;
-    }
-    void this._runProgrammaticMessagesTurn(
-      crypto.randomUUID(),
-      entry.messages,
-      {
-        signal: entry.signal
+  /**
+   * Run entries that never reached a step boundary as ONE queued turn over
+   * their combined messages — a turn per entry would have each later turn
+   * re-answering history the earlier ones just answered. All live entries
+   * settle with the shared turn's outcome. Abort signals are honored up to
+   * dispatch; the batched turn itself is not cancelable per-entry.
+   */
+  private _dispatchSteeringFallback(entries: SteeringEntry[]): void {
+    const live: SteeringEntry[] = [];
+    for (const entry of entries) {
+      if (
+        entry.steer === "require" ||
+        entry.epoch !== this._turnQueue.generation
+      ) {
+        entry.settle({ requestId: "", status: "skipped" });
+      } else if (entry.signal?.aborted) {
+        entry.settle({ requestId: "", status: "aborted" });
+      } else {
+        live.push(entry);
       }
-    )
-      .then((result) => entry.settle(result))
-      .catch((error) =>
-        entry.settle({
+    }
+    if (live.length === 0) return;
+    const messages = live.flatMap((entry) => entry.messages);
+    void this._runProgrammaticMessagesTurn(crypto.randomUUID(), messages, {})
+      .then((result) => {
+        for (const entry of live) entry.settle(result);
+      })
+      .catch((error) => {
+        const failure: ThinkSaveMessagesResult = {
           requestId: "",
           status: "error",
           error: error instanceof Error ? error.message : String(error)
-        })
-      );
+        };
+        for (const entry of live) entry.settle(failure);
+      });
   }
 
   /**
    * Drain pending steering entries into the upcoming step: persist and
    * broadcast their user messages, then return the step's messages with the
    * steered messages appended. Returns `undefined` when there is nothing to
-   * drain.
+   * inject.
    *
    * The base messages are the run's own in-flight model messages
    * (`event.messages` plus any overrides) — NOT a rebuild from session
@@ -6588,12 +6627,22 @@ export class Think<
    * Responses reasoning item ids / encrypted content) that exists only in
    * the streamText run's memory mid-turn; rebuilding from history would
    * silently drop it and break cross-step reasoning.
+   *
+   * Injected messages accumulate on the window and are re-appended on every
+   * subsequent step: the AI SDK rebuilds each step's input from the turn's
+   * initial messages plus the model's own response messages, so a
+   * single-step `prepareStep` override would silently evaporate at the next
+   * boundary. When the proactive context guard rebuilt this step's base
+   * from session history (`baseIncludesPersistedSteers`), previously
+   * injected steers are already in that head — only newly drained entries,
+   * persisted after the rebuild, still need injecting.
    */
   private async _drainSteeringIntoStep(
-    baseMessages: ModelMessage[]
+    baseMessages: ModelMessage[],
+    options?: { baseIncludesPersistedSteers?: boolean }
   ): Promise<ModelMessage[] | undefined> {
     const window = this._steeringWindow;
-    if (!window || window.pending.length === 0) return undefined;
+    if (!window) return undefined;
     const entries = window.pending.splice(0);
     const live: SteeringEntry[] = [];
     for (const entry of entries) {
@@ -6603,27 +6652,39 @@ export class Think<
         live.push(entry);
       }
     }
-    if (live.length === 0) return undefined;
 
-    const steeredUiMessages: UIMessage[] = [];
-    for (const entry of live) {
-      for (const message of entry.messages) {
-        steeredUiMessages.push(await this._appendMessageToHistory(message));
+    let newlyInjected: ModelMessage[] = [];
+    if (live.length > 0) {
+      const steeredUiMessages: UIMessage[] = [];
+      for (const entry of live) {
+        for (const message of entry.messages) {
+          steeredUiMessages.push(await this._appendMessageToHistory(message));
+        }
+      }
+      window.drained.push(...live);
+      this._broadcastMessages();
+
+      newlyInjected = await convertToModelMessages(steeredUiMessages);
+      for (const message of newlyInjected) {
+        this._turnSteeredModelMessages.add(message);
+      }
+      window.injectedModelMessages.push(...newlyInjected);
+      this._emit("chat:steered", {
+        requestId: this._turnQueue.activeRequestId ?? "",
+        messageIds: steeredUiMessages.map((message) => message.id)
+      });
+      try {
+        await this.onMessagesSteered(steeredUiMessages);
+      } catch (error) {
+        console.error("[Think] onMessagesSteered failed", error);
       }
     }
-    window.drained.push(...live);
-    this._broadcastMessages();
 
-    const steeredModelMessages =
-      await convertToModelMessages(steeredUiMessages);
-    for (const message of steeredModelMessages) {
-      this._turnSteeredModelMessages.add(message);
-    }
-    this._emit("chat:steered", {
-      requestId: this._turnQueue.activeRequestId ?? "",
-      messageIds: steeredUiMessages.map((message) => message.id)
-    });
-    return [...baseMessages, ...steeredModelMessages];
+    const inject = options?.baseIncludesPersistedSteers
+      ? newlyInjected
+      : window.injectedModelMessages;
+    if (inject.length === 0) return undefined;
+    return [...baseMessages, ...inject];
   }
 
   private async _runProgrammaticMessagesTurn(
