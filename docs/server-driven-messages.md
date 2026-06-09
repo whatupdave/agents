@@ -60,6 +60,39 @@ own external side effects around that turn.
 For Think-specific guidance that also compares raw child `chat()` calls with
 agent tools, see [Choosing a turn API](./think/index.md#choosing-a-turn-api).
 
+### Steering an active turn (`steer: true`)
+
+By default, a `saveMessages` call that arrives while another turn is running
+queues behind it and produces its own response. When the new message is a
+correction to work the agent is doing right now ("put a block on my calendar
+at 2pm" → "actually 3pm"), that means two responses: one that creates the 2pm
+event and a second that moves it.
+
+Pass `{ steer: true }` to fold the message into the running turn instead:
+
+```typescript
+await agent.saveMessages([userMsg], { steer: true });
+```
+
+The message is persisted and injected at the model's next step boundary
+(after the current tool call finishes), so the agent adjusts course mid-turn
+and produces a single response covering both messages. The injection appends
+to the run's in-flight messages, so provider state that exists only mid-turn
+— such as OpenAI Responses reasoning items — carries across steps unchanged.
+The call's promise resolves when the host turn finishes, with the host turn's
+status and `steered: true` on the result.
+
+Steering is best-effort. The call transparently falls back to the default
+queued-turn behavior (and `steered` stays unset) when folding in is not
+possible:
+
+- no turn is active, or the active turn is a structured workflow turn
+- the message arrives after the model's final step has started streaming
+- any message is not `role: "user"`, or the function form was used
+
+A `chat:steered` observability event is emitted whenever messages are folded
+into an active turn.
+
 ### When to use `saveMessages` vs `onChatResponse`
 
 **Use `saveMessages` when you control the trigger** — schedule callbacks, webhooks, email handlers, or any method where you decide when to inject a message.

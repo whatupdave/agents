@@ -1,0 +1,133 @@
+import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { getAgentByName } from "agents";
+
+async function freshSteeringAgent(name: string) {
+  return getAgentByName(env.SteeringTestAgent, name);
+}
+
+type PromptMessage = {
+  role: string;
+  content: Array<Record<string, unknown>>;
+};
+
+function parsePrompt(prompt: string): PromptMessage[] {
+  return JSON.parse(prompt) as PromptMessage[];
+}
+
+function userTexts(prompt: string): string[] {
+  return parsePrompt(prompt)
+    .filter((message) => message.role === "user")
+    .map((message) => JSON.stringify(message.content));
+}
+
+describe("Think — saveMessages steering", () => {
+  it("folds a mid-turn steer into the active turn at the next step", async () => {
+    const agent = await freshSteeringAgent("steer-mid-turn");
+    const run = await agent.runMidTurnSteer();
+
+    // One turn, two model calls: tool step, then the (steered) final step.
+    expect(run.prompts).toHaveLength(2);
+    expect(JSON.stringify(userTexts(run.prompts[0]))).toContain("2pm");
+    expect(JSON.stringify(userTexts(run.prompts[0]))).not.toContain("3pm");
+    expect(JSON.stringify(userTexts(run.prompts[1]))).toContain("2pm");
+    expect(JSON.stringify(userTexts(run.prompts[1]))).toContain("3pm");
+
+    // The steered message enters the conversation as the LAST message —
+    // after the in-flight assistant/tool steps, not spliced into history.
+    const secondPrompt = parsePrompt(run.prompts[1]);
+    const lastMessage = secondPrompt[secondPrompt.length - 1];
+    expect(lastMessage.role).toBe("user");
+    expect(JSON.stringify(lastMessage.content)).toContain("3pm");
+    const toolIndex = secondPrompt.findIndex((m) => m.role === "tool");
+    expect(toolIndex).toBeGreaterThan(-1);
+    expect(toolIndex).toBeLessThan(secondPrompt.length - 1);
+
+    // Both promises resolve against the SAME turn.
+    expect(run.turn.status).toBe("completed");
+    expect(run.steer.status).toBe("completed");
+    expect(run.steer.steered).toBe(true);
+    expect(run.steer.requestId).toBe(run.turn.requestId);
+
+    // Single combined response: [user 2pm, user 3pm, assistant].
+    expect(run.roles).toEqual(["user", "user", "assistant"]);
+  });
+
+  it("preserves in-turn reasoning provider metadata across a steered step", async () => {
+    const agent = await freshSteeringAgent("steer-reasoning");
+    const run = await agent.runMidTurnSteer();
+
+    // The second step's prompt must still carry the first step's reasoning
+    // part WITH its provider metadata (OpenAI Responses reasoning items live
+    // only in the run's in-memory messages mid-turn — rebuilding from
+    // session history would drop them).
+    const secondPrompt = parsePrompt(run.prompts[1]);
+    const assistant = secondPrompt.find((m) => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    const reasoning = assistant?.content.find(
+      (part) => part.type === "reasoning"
+    );
+    expect(reasoning).toBeDefined();
+    expect(JSON.stringify(reasoning)).toContain("rs_1");
+    expect(JSON.stringify(reasoning)).toContain("sig-1");
+  });
+
+  it("folds multiple steer calls into the same step and settles both", async () => {
+    const agent = await freshSteeringAgent("steer-double");
+    const run = await agent.runDoubleSteer();
+
+    expect(run.prompts).toHaveLength(2);
+    const secondUserTexts = JSON.stringify(userTexts(run.prompts[1]));
+    expect(secondUserTexts).toContain("3pm");
+    expect(secondUserTexts).toContain("standup");
+
+    expect(run.steer.steered).toBe(true);
+    expect(run.secondSteer?.steered).toBe(true);
+    expect(run.steer.requestId).toBe(run.turn.requestId);
+    expect(run.secondSteer?.requestId).toBe(run.turn.requestId);
+    expect(run.roles).toEqual(["user", "user", "user", "assistant"]);
+  });
+
+  it("falls back to a queued turn when the steer arrives after the final step", async () => {
+    const agent = await freshSteeringAgent("steer-post-final");
+    const run = await agent.runPostFinalStepSteer();
+
+    // Two model calls across two turns: the host turn never saw the steered
+    // message; the fallback turn did.
+    expect(run.prompts).toHaveLength(2);
+    expect(JSON.stringify(userTexts(run.prompts[0]))).not.toContain("3pm");
+    expect(JSON.stringify(userTexts(run.prompts[1]))).toContain("3pm");
+
+    expect(run.turn.status).toBe("completed");
+    expect(run.steer.status).toBe("completed");
+    expect(run.steer.steered).toBeUndefined();
+    expect(run.steer.requestId).not.toBe(run.turn.requestId);
+
+    // Two separate responses: [user 2pm, assistant, user 3pm, assistant].
+    expect(run.roles).toEqual(["user", "assistant", "user", "assistant"]);
+  });
+
+  it("behaves like a normal saveMessages call when no turn is active", async () => {
+    const agent = await freshSteeringAgent("steer-idle");
+    const run = await agent.runIdleSteer();
+
+    expect(run.prompts).toHaveLength(1);
+    expect(run.steer.status).toBe("completed");
+    expect(run.steer.steered).toBeUndefined();
+    expect(run.roles).toEqual(["user", "assistant"]);
+  });
+
+  it("refuses to steer non-user messages and queues them instead", async () => {
+    const agent = await freshSteeringAgent("steer-non-user");
+    const run = await agent.runNonUserSteer();
+
+    // Host turn (2 calls) + the queued non-user turn (1 call).
+    expect(run.prompts).toHaveLength(3);
+    // The host turn's final step never saw the assistant note.
+    expect(JSON.stringify(parsePrompt(run.prompts[1]))).not.toContain(
+      "afternoon slots"
+    );
+    expect(run.steer.steered).toBeUndefined();
+    expect(run.steer.requestId).not.toBe(run.turn.requestId);
+  });
+});

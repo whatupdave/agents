@@ -255,6 +255,15 @@ export type AgentObservabilityEvent =
       }
     >
   | BaseEvent<
+      "chat:steered",
+      {
+        /** Request id of the host turn the messages were folded into. */
+        requestId: string;
+        /** Ids of the user messages injected at the step boundary. */
+        messageIds: string[];
+      }
+    >
+  | BaseEvent<
       "agent_tool:recovery:begin",
       { runCount: number; totalTimeoutMs?: number }
     >

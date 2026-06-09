@@ -36,6 +36,10 @@
         "name": "OverflowRecoveryTestAgent"
       },
       {
+        "class_name": "SteeringTestAgent",
+        "name": "SteeringTestAgent"
+      },
+      {
         "class_name": "ThinkTestAgent",
         "name": "ThinkTestAgent"
       },
@@ -120,6 +124,7 @@
         "LoopTestAgent",
         "LoopToolTestAgent",
         "OverflowRecoveryTestAgent",
+        "SteeringTestAgent",
         "ThinkTestAgent",
         "ThinkToolsTestAgent",
         "ThinkFiberTestAgent",

@@ -6,6 +6,7 @@ export {
   LoopToolTestAgent,
   OverflowRecoveryTestAgent
 } from "./assistant-agent-loop";
+export { SteeringTestAgent } from "./steering";
 export {
   ThinkTestAgent,
   ThinkToolsTestAgent,

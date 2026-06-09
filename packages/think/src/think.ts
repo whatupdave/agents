@@ -213,6 +213,25 @@ function shouldMarkSkippedAfterGenerationChange(
   return status === "completed";
 }
 
+/**
+ * Final status for a finished turn: a generation bump (chat clear) trumps a
+ * clean completion as `"skipped"`, an abort downgrades a clean completion to
+ * `"aborted"`, and every other status passes through unchanged.
+ */
+function resolveTurnOutcomeStatus(
+  status: SaveMessagesResult["status"],
+  generationChanged: boolean,
+  wasAborted: boolean
+): SaveMessagesResult["status"] {
+  if (generationChanged && shouldMarkSkippedAfterGenerationChange(status)) {
+    return "skipped";
+  }
+  if (wasAborted && status === "completed") {
+    return "aborted";
+  }
+  return status;
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
@@ -563,6 +582,28 @@ type StreamResultStatus = {
 
 type ProgrammaticMessagesResult = SaveMessagesResult & {
   output?: unknown;
+};
+
+/**
+ * One accepted `saveMessages({ steer: true })` call. Lives in the active
+ * turn's {@link SteeringWindow} until it is either drained into a step
+ * (then settled with the host turn's outcome) or handed back to a normal
+ * queued turn when the host turn ends without reaching another step.
+ */
+type SteeringEntry = {
+  messages: UIMessage[];
+  /** Turn-queue generation at acceptance; a bump (chat clear) voids the entry. */
+  epoch: number;
+  signal?: AbortSignal;
+  /** Resolves the steering caller's `saveMessages` promise. Idempotent. */
+  settle: (result: ThinkSaveMessagesResult) => void;
+};
+
+type SteeringWindow = {
+  /** Accepted but not yet seen by the model. */
+  pending: SteeringEntry[];
+  /** Persisted and injected into the run; settled when the host turn ends. */
+  drained: SteeringEntry[];
 };
 
 type ChatRecoveryRetryData = {
@@ -1155,6 +1196,41 @@ import type {
   SaveMessagesOptions,
   SaveMessagesResult
 } from "agents/chat";
+
+/**
+ * Options for {@link Think.saveMessages}. Extends the shared
+ * {@link SaveMessagesOptions} with Think-only behavior.
+ */
+export interface ThinkSaveMessagesOptions extends SaveMessagesOptions {
+  /**
+   * Fold these messages into the chat turn that is currently running
+   * instead of queueing a separate turn behind it.
+   *
+   * When a steerable turn is active, the messages are persisted and
+   * injected at the next step boundary — the model sees them mid-turn,
+   * adjusts course, and produces a single response covering both the
+   * original request and the steered follow-up. The returned promise
+   * resolves when that host turn finishes, mirroring its status, with
+   * `steered: true` on the result.
+   *
+   * Falls back to the normal queued-turn behavior (and `steered` stays
+   * unset) when steering is not possible: no turn is active, the active
+   * turn is a structured workflow turn, the messages arrived after the
+   * model's final step, any message is not `role: "user"`, or the
+   * function form of `saveMessages` was used.
+   */
+  steer?: boolean;
+}
+
+/** Result of a {@link Think.saveMessages} call. */
+export type ThinkSaveMessagesResult = SaveMessagesResult & {
+  /**
+   * `true` when the messages were folded into an already-running turn
+   * (see {@link ThinkSaveMessagesOptions.steer}); the result's status is
+   * that host turn's outcome. Unset when the call ran its own turn.
+   */
+  steered?: boolean;
+};
 
 // ── Lifecycle hook types ────────────────────────────────────────
 
@@ -2141,6 +2217,20 @@ export class Think<
 
   private _aborts = new AbortRegistry();
   private _turnQueue = new TurnQueue();
+  // Steering window for the active turn (see `saveMessages` `steer`). Opened
+  // synchronously by each steerable turn body when it starts and nulled
+  // synchronously when the turn can no longer absorb messages, so a steer
+  // call observes either an open window (entry accepted, host turn owns it)
+  // or none (fall back to a queued turn) — never a stranded in-between. The
+  // worker is single-threaded, so open/close and the acceptance check cannot
+  // interleave.
+  private _steeringWindow: SteeringWindow | null = null;
+  // Model messages injected into the active streamText run by steering.
+  // They are persisted to the session at drain time, so when the proactive
+  // context guard rebuilds the head from history they are already in it —
+  // this set lets the guard drop them from the in-flight tail to avoid
+  // duplication. Reset at the top of every `_runInferenceLoop`.
+  private _turnSteeredModelMessages = new Set<ModelMessage>();
   protected _resumableStream!: ResumableStream;
   private _pendingResumeConnections: Set<string> = new Set();
   private _lastClientTools: ClientToolSchema[] | undefined;
@@ -3264,8 +3354,13 @@ export class Think<
 
       // Rebuild the compacted head, then splice this turn's in-flight steps
       // (which are not yet persisted to the session) back onto the tail.
+      // Steered messages are the exception: they WERE persisted at drain
+      // time, so the rebuilt head already contains them — drop them from the
+      // tail or the model would see them twice.
       const head = await this._assembleModelMessages(this._activeTurnTools);
-      const tail = event.messages.slice(this._turnModelMessageBaseline);
+      const tail = event.messages
+        .slice(this._turnModelMessageBaseline)
+        .filter((message) => !this._turnSteeredModelMessages.has(message));
       const merged = [...head, ...tail];
       // Re-baseline so a second guard fire this turn keeps the new tail. This
       // is correct only if the AI SDK carries our returned `messages` override
@@ -3295,6 +3390,10 @@ export class Think<
     this._activeStallTimeoutMs = undefined;
     // Reset the proactive-compaction cap for this streamText run.
     this._proactiveCompactionsThisRun = 0;
+    // Messages steered into a previous run (e.g. before an overflow retry)
+    // are persisted history by now — this run's assembly includes them, so
+    // the dedup set starts empty.
+    this._turnSteeredModelMessages = new Set();
     if (this.waitForMcpConnections) {
       const timeout =
         typeof this.waitForMcpConnections === "object"
@@ -3530,6 +3629,18 @@ export class Think<
             },
             activeTools: [finalAnswerToolName]
           };
+        }
+        // Steered messages (saveMessages `steer`) enter the run last so the
+        // model sees them as the newest input, after whatever messages the
+        // guard/subclass chose for this step. Only turn bodies that opened a
+        // steering window can have entries here, so structured workflow
+        // turns never take this branch.
+        const steeredMessages = await this._drainSteeringIntoStep(
+          ((withMessages as { messages?: ModelMessage[] }).messages ??
+            event.messages) as ModelMessage[]
+        );
+        if (steeredMessages) {
+          return { ...withMessages, messages: steeredMessages };
         }
         return withMessages;
       }) satisfies PrepareStepFunction<ToolSet>,
@@ -4109,6 +4220,17 @@ export class Think<
           await this._appendMessageToHistory(userMsg);
           this._broadcastMessages();
 
+          // Outcome for steered callers folded into this turn. Pessimistic
+          // default so a body that throws settles them as an error rather
+          // than a false "completed".
+          let turnOutcome: {
+            status: SaveMessagesResult["status"];
+            error?: string;
+          } = {
+            status: "error",
+            error: "The chat turn ended unexpectedly."
+          };
+
           const chatBody = async () => {
             // Bounded compact-and-retry loop (opt-in via
             // `contextOverflow.reactive`). A turn that overflows the context
@@ -4146,6 +4268,7 @@ export class Think<
                   error: errorMessage
                 });
                 await callback.onError(errorMessage);
+                turnOutcome = { status: "error", error: errorMessage };
                 return;
               }
 
@@ -4181,15 +4304,33 @@ export class Think<
                   error
                 );
                 await callback.onError(message);
+                turnOutcome = { status: "error", error: message };
+                return;
               }
+              turnOutcome = { status, error };
               return;
             }
           };
 
-          if (this.chatRecovery) {
-            await this._runChatRecoveryFiber(requestId, false, chatBody);
-          } else {
-            await chatBody();
+          this._openSteeringWindow();
+          try {
+            if (this.chatRecovery) {
+              await this._runChatRecoveryFiber(requestId, false, chatBody);
+            } else {
+              await chatBody();
+            }
+          } finally {
+            this._closeSteeringWindow({
+              requestId,
+              status: resolveTurnOutcomeStatus(
+                turnOutcome.status,
+                false,
+                abortSignal?.aborted ?? false
+              ),
+              ...(turnOutcome.error !== undefined && {
+                error: turnOutcome.error
+              })
+            });
           }
         });
       });
@@ -6279,15 +6420,187 @@ export class Think<
    * // abortSignal so a parent stop / tab close cancels the helper.
    * await helper.saveMessages([userMsg], { signal: abortSignal });
    * ```
+   *
+   * @example Steering an active turn
+   * ```typescript
+   * // "Put a block on my calendar at 2pm" is mid-turn; fold in the
+   * // correction so the agent adjusts course and responds once.
+   * await agent.saveMessages([userMsg], { steer: true });
+   * ```
    */
   async saveMessages(
     messages:
       | UIMessage[]
       | ((currentMessages: UIMessage[]) => UIMessage[] | Promise<UIMessage[]>),
-    options?: SaveMessagesOptions
-  ): Promise<SaveMessagesResult> {
+    options?: ThinkSaveMessagesOptions
+  ): Promise<ThinkSaveMessagesResult> {
+    if (options?.steer) {
+      const steered = this._trySteerActiveTurn(messages, options);
+      if (steered) return steered;
+    }
     const requestId = crypto.randomUUID();
     return this._runProgrammaticMessagesTurn(requestId, messages, options);
+  }
+
+  // ── Steering ────────────────────────────────────────────────────
+
+  /**
+   * Accept messages into the active turn's steering window, or return
+   * `undefined` when steering is not possible and the caller should run a
+   * normal queued turn. The returned promise settles with the host turn's
+   * outcome (or, for messages that arrive after the model's final step,
+   * with the outcome of the fallback turn the window dispatches on close).
+   */
+  private _trySteerActiveTurn(
+    messages:
+      | UIMessage[]
+      | ((currentMessages: UIMessage[]) => UIMessage[] | Promise<UIMessage[]>),
+    options?: ThinkSaveMessagesOptions
+  ): Promise<ThinkSaveMessagesResult> | undefined {
+    const window = this._steeringWindow;
+    if (!window) return undefined;
+    // The function form derives messages from the post-turn history — it has
+    // no meaningful mid-turn shape. Non-user messages (assistant/tool) cannot
+    // be injected into a running provider conversation.
+    if (typeof messages === "function") return undefined;
+    if (messages.length === 0) return undefined;
+    if (messages.some((message) => message.role !== "user")) return undefined;
+    // A pre-aborted signal short-circuits through the normal path, which
+    // already implements that contract.
+    if (options?.signal?.aborted) return undefined;
+
+    const epoch = this._turnQueue.generation;
+    // Build and push the entry SYNCHRONOUSLY — the window observed above is
+    // only guaranteed live within this synchronous frame. Deferring the push
+    // (e.g. into a later-invoked thunk) could land it in a window that has
+    // already closed, stranding the caller forever.
+    let resolve!: (result: ThinkSaveMessagesResult) => void;
+    const settled = new Promise<ThinkSaveMessagesResult>((r) => {
+      resolve = r;
+    });
+    const onAbort = () => {
+      // Withdraw only while still pending — once drained the messages are
+      // part of the host turn and follow its lifecycle.
+      const index = window.pending.indexOf(entry);
+      if (index !== -1) {
+        window.pending.splice(index, 1);
+        settle({ requestId: "", status: "aborted" });
+      }
+    };
+    const settle = (result: ThinkSaveMessagesResult) => {
+      options?.signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const entry: SteeringEntry = {
+      messages,
+      epoch,
+      signal: options?.signal,
+      settle
+    };
+    options?.signal?.addEventListener("abort", onAbort, { once: true });
+    window.pending.push(entry);
+    return this.keepAliveWhile(() => settled);
+  }
+
+  /**
+   * Open a steering window for the turn body that is about to run. Call
+   * only from turn bodies that can safely absorb user messages mid-run
+   * (i.e. not structured workflow-prompt turns).
+   */
+  private _openSteeringWindow(): void {
+    this._steeringWindow = { pending: [], drained: [] };
+  }
+
+  /**
+   * Close the active steering window: settle drained entries with the host
+   * turn's outcome and hand entries that never reached a step boundary to
+   * normal queued turns. The window is nulled before anything else so a
+   * steer call racing this close falls back to queueing instead of landing
+   * in a dead window.
+   */
+  private _closeSteeringWindow(outcome: SaveMessagesResult): void {
+    const window = this._steeringWindow;
+    if (!window) return;
+    this._steeringWindow = null;
+    for (const entry of window.drained) {
+      entry.settle({ ...outcome, steered: true });
+    }
+    for (const entry of window.pending) {
+      this._dispatchSteeringFallback(entry);
+    }
+  }
+
+  /** Run an undrained steering entry as its own queued turn. */
+  private _dispatchSteeringFallback(entry: SteeringEntry): void {
+    if (entry.epoch !== this._turnQueue.generation) {
+      entry.settle({ requestId: "", status: "skipped" });
+      return;
+    }
+    void this._runProgrammaticMessagesTurn(
+      crypto.randomUUID(),
+      entry.messages,
+      {
+        signal: entry.signal
+      }
+    )
+      .then((result) => entry.settle(result))
+      .catch((error) =>
+        entry.settle({
+          requestId: "",
+          status: "error",
+          error: error instanceof Error ? error.message : String(error)
+        })
+      );
+  }
+
+  /**
+   * Drain pending steering entries into the upcoming step: persist and
+   * broadcast their user messages, then return the step's messages with the
+   * steered messages appended. Returns `undefined` when there is nothing to
+   * drain.
+   *
+   * The base messages are the run's own in-flight model messages
+   * (`event.messages` plus any overrides) — NOT a rebuild from session
+   * history. The in-flight tail carries provider metadata (e.g. OpenAI
+   * Responses reasoning item ids / encrypted content) that exists only in
+   * the streamText run's memory mid-turn; rebuilding from history would
+   * silently drop it and break cross-step reasoning.
+   */
+  private async _drainSteeringIntoStep(
+    baseMessages: ModelMessage[]
+  ): Promise<ModelMessage[] | undefined> {
+    const window = this._steeringWindow;
+    if (!window || window.pending.length === 0) return undefined;
+    const entries = window.pending.splice(0);
+    const live: SteeringEntry[] = [];
+    for (const entry of entries) {
+      if (entry.epoch !== this._turnQueue.generation) {
+        entry.settle({ requestId: "", status: "skipped" });
+      } else {
+        live.push(entry);
+      }
+    }
+    if (live.length === 0) return undefined;
+
+    const steeredUiMessages: UIMessage[] = [];
+    for (const entry of live) {
+      for (const message of entry.messages) {
+        steeredUiMessages.push(await this._appendMessageToHistory(message));
+      }
+    }
+    window.drained.push(...live);
+    this._broadcastMessages();
+
+    const steeredModelMessages =
+      await convertToModelMessages(steeredUiMessages);
+    for (const message of steeredModelMessages) {
+      this._turnSteeredModelMessages.add(message);
+    }
+    this._emit("chat:steered", {
+      requestId: this._turnQueue.activeRequestId ?? "",
+      messageIds: steeredUiMessages.map((message) => message.id)
+    });
+    return [...baseMessages, ...steeredModelMessages];
   }
 
   private async _runProgrammaticMessagesTurn(
@@ -6343,6 +6656,10 @@ export class Think<
           requestId,
           options?.signal
         );
+        // Structured workflow turns terminate via the synthetic
+        // `final_answer` tool — a steered user message would corrupt that
+        // contract, so they do not open a window.
+        if (!options?.workflowPrompt) this._openSteeringWindow();
         try {
           const programmaticBody = async () => {
             // Bounded compact-and-retry loop (opt-in via
@@ -6432,20 +6749,26 @@ export class Think<
           }
         } finally {
           if (abortSignal?.aborted) wasAborted = true;
+          this._closeSteeringWindow({
+            requestId,
+            status: resolveTurnOutcomeStatus(
+              status,
+              this._turnQueue.generation !== epoch,
+              wasAborted
+            ),
+            ...(error !== undefined && { error })
+          });
           detachExternal();
           this._aborts.remove(requestId);
         }
       });
     });
 
-    if (
-      this._turnQueue.generation !== epoch &&
-      shouldMarkSkippedAfterGenerationChange(status)
-    ) {
-      status = "skipped";
-    } else if (wasAborted && status === "completed") {
-      status = "aborted";
-    }
+    status = resolveTurnOutcomeStatus(
+      status,
+      this._turnQueue.generation !== epoch,
+      wasAborted
+    );
 
     return {
       requestId,
@@ -6501,6 +6824,7 @@ export class Think<
           requestId,
           options?.signal
         );
+        this._openSteeringWindow();
         try {
           const continueTurnBody = async () => {
             const result = await agentContext.run(
@@ -6540,20 +6864,26 @@ export class Think<
           }
         } finally {
           if (abortSignal?.aborted) wasAborted = true;
+          this._closeSteeringWindow({
+            requestId,
+            status: resolveTurnOutcomeStatus(
+              status,
+              this._turnQueue.generation !== epoch,
+              wasAborted
+            ),
+            ...(error !== undefined && { error })
+          });
           detachExternal();
           this._aborts.remove(requestId);
         }
       });
     });
 
-    if (
-      this._turnQueue.generation !== epoch &&
-      shouldMarkSkippedAfterGenerationChange(status)
-    ) {
-      status = "skipped";
-    } else if (wasAborted && status === "completed") {
-      status = "aborted";
-    }
+    status = resolveTurnOutcomeStatus(
+      status,
+      this._turnQueue.generation !== epoch,
+      wasAborted
+    );
 
     return { requestId, status, ...(error !== undefined && { error }) };
   }
@@ -6586,6 +6916,7 @@ export class Think<
           requestId,
           options?.signal
         );
+        this._openSteeringWindow();
         try {
           const retryTurnBody = async () => {
             const result = await agentContext.run(
@@ -6622,20 +6953,26 @@ export class Think<
           }
         } finally {
           if (abortSignal?.aborted) wasAborted = true;
+          this._closeSteeringWindow({
+            requestId,
+            status: resolveTurnOutcomeStatus(
+              status,
+              this._turnQueue.generation !== epoch,
+              wasAborted
+            ),
+            ...(error !== undefined && { error })
+          });
           detachExternal();
           this._aborts.remove(requestId);
         }
       });
     });
 
-    if (
-      this._turnQueue.generation !== epoch &&
-      shouldMarkSkippedAfterGenerationChange(status)
-    ) {
-      status = "skipped";
-    } else if (wasAborted && status === "completed") {
-      status = "aborted";
-    }
+    status = resolveTurnOutcomeStatus(
+      status,
+      this._turnQueue.generation !== epoch,
+      wasAborted
+    );
 
     return { requestId, status, ...(error !== undefined && { error }) };
   }
@@ -7044,6 +7381,17 @@ export class Think<
               }
             }
 
+            // Outcome for steered callers folded into this turn. Pessimistic
+            // default so a body that throws settles them as an error rather
+            // than a false "completed".
+            let turnOutcome: {
+              status: SaveMessagesResult["status"];
+              error?: string;
+            } = {
+              status: "error",
+              error: "The chat turn ended unexpectedly."
+            };
+
             const chatTurnBody = async () => {
               // Bounded compact-and-retry loop (opt-in via
               // `contextOverflow.reactive`). A turn that overflows the
@@ -7075,6 +7423,7 @@ export class Think<
                     body: "No response was generated.",
                     done: true
                   });
+                  turnOutcome = { status: "completed" };
                   return;
                 }
 
@@ -7093,10 +7442,15 @@ export class Think<
                     }
                   : undefined;
 
-                await this._streamResult(requestId, result, abortSignal, {
-                  parentId: branchParentId,
-                  overflowRecovery
-                });
+                const streamResult = await this._streamResult(
+                  requestId,
+                  result,
+                  abortSignal,
+                  {
+                    parentId: branchParentId,
+                    overflowRecovery
+                  }
+                );
 
                 if (overflowRequested) {
                   if (
@@ -7125,15 +7479,40 @@ export class Think<
                     done: true,
                     error: true
                   });
+                  turnOutcome = { status: "error", error: message };
+                  return;
                 }
+                turnOutcome = {
+                  status: streamResult.status,
+                  error: streamResult.error
+                };
                 return;
               }
             };
 
-            if (this.chatRecovery) {
-              await this._runChatRecoveryFiber(requestId, false, chatTurnBody);
-            } else {
-              await chatTurnBody();
+            this._openSteeringWindow();
+            try {
+              if (this.chatRecovery) {
+                await this._runChatRecoveryFiber(
+                  requestId,
+                  false,
+                  chatTurnBody
+                );
+              } else {
+                await chatTurnBody();
+              }
+            } finally {
+              this._closeSteeringWindow({
+                requestId,
+                status: resolveTurnOutcomeStatus(
+                  turnOutcome.status,
+                  this._turnQueue.generation !== epoch,
+                  abortSignal?.aborted ?? false
+                ),
+                ...(turnOutcome.error !== undefined && {
+                  error: turnOutcome.error
+                })
+              });
             }
           },
           {
@@ -10473,6 +10852,15 @@ export class Think<
           this._continuation.pending.pastCoalesce = true;
         }
         let streamed = false;
+        // Outcome for steered callers folded into this continuation turn.
+        let turnOutcome: {
+          status: SaveMessagesResult["status"];
+          error?: string;
+        } = {
+          status: "error",
+          error: "The chat turn ended unexpectedly."
+        };
+        this._openSteeringWindow();
         try {
           const continuationBody = async () => {
             const result = await agentContext.run(
@@ -10491,10 +10879,21 @@ export class Think<
                 })
             );
             if (result) {
-              await this._streamResult(requestId, result, abortSignal, {
-                continuation: true
-              });
+              const streamResult = await this._streamResult(
+                requestId,
+                result,
+                abortSignal,
+                {
+                  continuation: true
+                }
+              );
+              turnOutcome = {
+                status: streamResult.status,
+                error: streamResult.error
+              };
               streamed = true;
+            } else {
+              turnOutcome = { status: "completed" };
             }
           };
 
@@ -10504,6 +10903,17 @@ export class Think<
             await continuationBody();
           }
         } finally {
+          this._closeSteeringWindow({
+            requestId,
+            status: resolveTurnOutcomeStatus(
+              turnOutcome.status,
+              false,
+              abortSignal?.aborted ?? false
+            ),
+            ...(turnOutcome.error !== undefined && {
+              error: turnOutcome.error
+            })
+          });
           this._aborts.remove(requestId);
           if (!streamed) {
             this._continuation.sendResumeNone();
