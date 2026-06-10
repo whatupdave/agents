@@ -222,6 +222,32 @@ export class SteeringTestAgent extends Think {
   }
 
   /**
+   * Steer a message the caller ALREADY PERSISTED (integrators persist
+   * inbound messages up front and rely on `appendMessage` no-op'ing on the
+   * existing id) while the final text step is streaming. The entry misses
+   * every boundary and falls back to a queued turn — whose model request
+   * must present the correction at the tail, after the host turn's reply
+   * that landed behind it in history (a request ending in an assistant
+   * message gets the continue-checkpoint and answers nothing).
+   */
+  async runPersistedFallbackSteer(): Promise<SteeringRunSummary> {
+    this._reset("gated-text");
+    const streamStarted = new Promise<void>((resolve) => {
+      this._streamStarted = resolve;
+    });
+    const turnPromise = this.saveMessages([
+      userMessage("create a calendar block at 2pm")
+    ]);
+    await streamStarted;
+    const correction = userMessage("actually make it 3pm");
+    await this.appendMessageToHistory(correction);
+    const steerPromise = this.saveMessages([correction], { steer: true });
+    this._streamGate?.();
+    const [turn, steer] = await Promise.all([turnPromise, steerPromise]);
+    return this._summarize(turn, steer);
+  }
+
+  /**
    * `steer: "require"` while the final text step is streaming — past the
    * last prepareStep, so the entry is dropped: no fallback turn, message
    * never persisted, resolves `skipped`.

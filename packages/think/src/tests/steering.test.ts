@@ -167,6 +167,34 @@ describe("Think — saveMessages steering", () => {
     expect(run.roles).toEqual(["user", "assistant", "user", "assistant"]);
   });
 
+  it("re-seats an already-persisted fallback steer behind the host reply", async () => {
+    const agent = await freshSteeringAgent("steer-persisted-fallback");
+    const run = await agent.runPersistedFallbackSteer();
+
+    expect(run.prompts).toHaveLength(2);
+    expect(run.turn.status).toBe("completed");
+    expect(run.steer.status).toBe("completed");
+    expect(run.steer.steered).toBeUndefined();
+
+    // The fallback turn's request must END with the correction as the
+    // newest user message. Without re-seating, the pre-persisted correction
+    // sits BEFORE the host reply, the request ends on an assistant message,
+    // and the continue-checkpoint turns the fallback into an empty
+    // "continue" turn.
+    const fallbackPrompt = parsePrompt(run.prompts[1]);
+    const lastMessage = fallbackPrompt[fallbackPrompt.length - 1];
+    expect(lastMessage.role).toBe("user");
+    expect(JSON.stringify(lastMessage.content)).toContain("3pm");
+    expect(JSON.stringify(fallbackPrompt)).not.toContain(
+      "Continue your previous response"
+    );
+
+    // Persisted history keeps ARRIVAL order — the re-seat is request-shaping
+    // only: [2pm, correction (persisted mid-stream), host reply, fallback
+    // reply].
+    expect(run.roles).toEqual(["user", "user", "assistant", "assistant"]);
+  });
+
   it('drops a steer:"require" call that misses the active turn', async () => {
     const agent = await freshSteeringAgent("steer-require-post-final");
     const run = await agent.runPostFinalStepRequireSteer();

@@ -1272,6 +1272,13 @@ export interface TurnInput {
   workflowPrompt?: ThinkWorkflowPromptContext;
   /** Whether this is a continuation turn (auto-continue after tool result, recovery). */
   continuation: boolean;
+  /**
+   * Ids of persisted messages to present at the tail of the model request,
+   * in their history-relative order. Set by the steering fallback for
+   * messages that sit in history behind the host turn's reply (see
+   * `presentMessagesAtRequestTail` on `_runProgrammaticMessagesTurn`).
+   */
+  requestTailMessageIds?: string[];
 }
 
 /**
@@ -3304,9 +3311,22 @@ export class Think<
    * head through the exact same pipeline.
    */
   private async _assembleModelMessages(
-    tools: ToolSet
+    tools: ToolSet,
+    requestTailMessageIds?: string[]
   ): Promise<Awaited<ReturnType<typeof convertToModelMessages>>> {
-    const history = await this._repairTranscriptForProvider(this.messages);
+    // Stable partition: messages named by `requestTailMessageIds` move to the
+    // end of the request (keeping their relative order) so the model treats
+    // them as the newest input. Persisted history is untouched — this shapes
+    // only the request, like the steering drain's mid-turn injection.
+    let base = this.messages;
+    if (requestTailMessageIds && requestTailMessageIds.length > 0) {
+      const tailIds = new Set(requestTailMessageIds);
+      const tail = base.filter((message) => tailIds.has(message.id));
+      if (tail.length > 0) {
+        base = [...base.filter((message) => !tailIds.has(message.id)), ...tail];
+      }
+    }
+    const history = await this._repairTranscriptForProvider(base);
     const truncated = truncateOlderMessages(history) as UIMessage[];
     // `_repairTranscriptForProvider` above already heals orphan tool calls
     // (flipping them to errored results, preserving the record). This is the
@@ -3457,7 +3477,10 @@ export class Think<
     const baseSystem = frozenPrompt || this.getSystemPrompt();
     const system = this._systemPromptForTurn(baseSystem, tools);
 
-    const messages = await this._assembleModelMessages(tools);
+    const messages = await this._assembleModelMessages(
+      tools,
+      input.requestTailMessageIds
+    );
 
     if (messages.length === 0) {
       throw new Error(
@@ -6601,7 +6624,9 @@ export class Think<
     }
     if (live.length === 0) return;
     const messages = live.flatMap((entry) => entry.messages);
-    void this._runProgrammaticMessagesTurn(crypto.randomUUID(), messages, {})
+    void this._runProgrammaticMessagesTurn(crypto.randomUUID(), messages, {
+      presentMessagesAtRequestTail: true
+    })
       .then((result) => {
         for (const entry of live) entry.settle(result);
       })
@@ -6698,6 +6723,19 @@ export class Think<
       captureOutput?: boolean;
       body?: Record<string, unknown>;
       workflowPrompt?: ThinkWorkflowPromptContext;
+      /**
+       * Present this turn's messages at the TAIL of the model request even
+       * when they already sit earlier in persisted history. Used by the
+       * steering fallback, whose job is to answer the messages as the NEWEST
+       * user input: integrators persist inbound messages before calling
+       * `saveMessages` (relying on `appendMessage` no-op'ing on the existing
+       * id), so by fallback time the message can sit BEHIND the host turn's
+       * reply — and a request ending on that reply gets the
+       * continue-checkpoint and answers nothing. Request-shaping only;
+       * persisted history keeps arrival order (messages are parent-linked, so
+       * a storage-level move would orphan the reply's parent pointer).
+       */
+      presentMessagesAtRequestTail?: boolean;
     }
   ): Promise<ProgrammaticMessagesResult> {
     const clientTools = this._lastClientTools;
@@ -6765,7 +6803,14 @@ export class Think<
                     clientTools,
                     body,
                     workflowPrompt: options?.workflowPrompt,
-                    continuation: false
+                    continuation: false,
+                    ...(options?.presentMessagesAtRequestTail
+                      ? {
+                          requestTailMessageIds: resolved.map(
+                            (message) => message.id
+                          )
+                        }
+                      : {})
                   })
               );
 
